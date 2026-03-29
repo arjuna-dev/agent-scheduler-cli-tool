@@ -183,6 +183,7 @@ class SchedulerTests(unittest.TestCase):
             use_open=False,
             weekdays=[1, 3],
         )
+        self.assertEqual(argv[0], self.scheduler.RUNNER_PYTHON)
         self.assertNotIn("--slot-key", argv)
         self.assertIn("--scheduled-time", argv)
         self.assertIn("--", argv)
@@ -199,6 +200,7 @@ class SchedulerTests(unittest.TestCase):
             command_args=["--x"],
             use_open=False,
         )
+        self.assertEqual(argv[0], self.scheduler.RUNNER_PYTHON)
         self.assertIn("--cleanup-label", argv)
         self.assertIn("com.agent-scheduler.once.demo-job", argv)
 
@@ -374,7 +376,7 @@ class SchedulerTests(unittest.TestCase):
                 self.scheduler.GENERATED_JOBS_DIR = original_dir
 
         self.assertNotIn("trap cleanup EXIT", content)
-        self.assertIn("'python3' '/tmp/task.py'", content)
+        self.assertIn("'/tmp/task.py'", content)
 
     def test_schedule_codex_parser_exposes_prompt(self):
         args = self.parse_codex_args("--daily", "09:30")

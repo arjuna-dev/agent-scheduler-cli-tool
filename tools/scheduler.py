@@ -22,6 +22,7 @@ DEFAULT_PATH = os.environ.get("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin
 DOMAIN = f"gui/{os.getuid()}"
 LABEL_PREFIX = "com.agent-scheduler"
 PROMPT_ENV_KEY = "AGENT_SCHEDULER_PROMPT"
+RUNNER_PYTHON = str(Path(sys.executable).resolve())
 COMMON_CODEX_PROMPT_PREFIX = """You are running as a scheduled Codex job.
 Use the current working directory as the workspace root.
 Before doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.
@@ -584,7 +585,7 @@ def recurring_runner_argv(
     weekdays: list[int] | None,
 ) -> list[str]:
     return [
-        "python3",
+        RUNNER_PYTHON,
         str(PROJECT_DIR / "tools" / "job_runner.py"),
         "recurring",
         "--job",
@@ -612,7 +613,7 @@ def once_runner_argv(
     use_open: bool,
 ) -> list[str]:
     return [
-        "python3",
+        RUNNER_PYTHON,
         str(PROJECT_DIR / "tools" / "job_runner.py"),
         "once",
         "--job",
