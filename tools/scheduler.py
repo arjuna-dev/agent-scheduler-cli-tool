@@ -7,6 +7,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import shlex
 from datetime import datetime
 from calendar import monthrange
 from pathlib import Path
@@ -20,6 +21,14 @@ GENERATED_JOBS_DIR = SUPPORT_DIR / "jobs"
 DEFAULT_PATH = os.environ.get("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 DOMAIN = f"gui/{os.getuid()}"
 LABEL_PREFIX = "com.agent-scheduler"
+PROMPT_ENV_KEY = "AGENT_SCHEDULER_PROMPT"
+COMMON_CODEX_PROMPT_PREFIX = """You are running as a scheduled Codex job.
+Use the current working directory as the workspace root.
+Before doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.
+Before finishing this run, ensure `SESSIONS/` exists under the workspace root and save the whole conversation appending as you go with each message to a markdown file in `SESSIONS/` using a timestamped filename such as `YYYY-MM-DDTHH-MM-SS.md`.
+"""
+RECURRING_CODEX_PROMPT_PREFIX = """Before starting the main task, inspect the existing session files and identify the most recent prior date that has session history. If there is not already a distilled memory markdown file for that date, ensure `MEMORY/` exists under the workspace root and create `MEMORY/YYYY-MM-DD.md` for that date with a distilled summary of that date's sessions.
+"""
 ISO_WEEKDAY_NAMES = {
     "mon": 1,
     "monday": 1,
@@ -78,6 +87,20 @@ def build_standard_env(extra_env: list[str]) -> dict[str, str]:
     return env
 
 
+def upsert_env(extra_env: list[str], key: str, value: str) -> list[str]:
+    updated = [item for item in extra_env if item.split("=", 1)[0] != key]
+    updated.append(f"{key}={value}")
+    return updated
+
+
+def build_codex_prompt(prompt: str, *, recurring: bool) -> str:
+    prefix_parts = [COMMON_CODEX_PROMPT_PREFIX.strip()]
+    if recurring:
+        prefix_parts.append(RECURRING_CODEX_PROMPT_PREFIX.strip())
+    prefix = "\n\n".join(prefix_parts)
+    return f"{prefix}\n\nTask:\n{prompt.strip()}"
+
+
 def installed_plist_path(label: str) -> Path:
     return LAUNCH_AGENTS_DIR / f"{label}.plist"
 
@@ -89,6 +112,223 @@ def plist_exists(label: str) -> bool:
 def write_plist(path: Path, payload: dict) -> None:
     with path.open("wb") as fh:
         plistlib.dump(payload, fh, sort_keys=False)
+
+
+def read_plist(path: Path) -> dict:
+    with path.open("rb") as fh:
+        return plistlib.load(fh)
+
+
+def runner_program_arguments(label: str, payload: dict) -> list[str]:
+    program_arguments = payload["ProgramArguments"]
+    if not label.startswith(f"{LABEL_PREFIX}.once."):
+        return program_arguments
+
+    wrapper = Path(program_arguments[0])
+    lines = [line.strip() for line in wrapper.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return shlex.split(lines[-1])
+
+
+def payload_extra_env(payload: dict) -> list[str]:
+    env = payload.get("EnvironmentVariables", {})
+    return [
+        f"{key}={value}"
+        for key, value in env.items()
+        if key not in {"HOME", "PATH", PROMPT_ENV_KEY}
+    ]
+
+
+def parse_notification_script(script: str) -> tuple[str, str]:
+    match = re.fullmatch(r'display notification "(?P<body>(?:\\.|[^"])*)" with title "(?P<title>(?:\\.|[^"])*)"', script)
+    if not match:
+        raise SystemExit("unsupported stored notification command")
+    body = bytes(match.group("body"), "utf-8").decode("unicode_escape")
+    title = bytes(match.group("title"), "utf-8").decode("unicode_escape")
+    return title, body
+
+
+def extract_runner_command(program_arguments: list[str]) -> tuple[str, list[str], bool]:
+    parser_argv, command_args = split_command_args(program_arguments)
+    idx = parser_argv.index("--command")
+    command = parser_argv[idx + 1]
+    tail = parser_argv[idx + 2 :]
+    use_open = False
+    if "--open" in tail:
+        use_open = True
+        tail = [value for value in tail if value != "--open"]
+    return command, command_args, use_open
+
+
+def schedule_config_from_payload(label: str, payload: dict) -> dict:
+    interval = payload["StartCalendarInterval"]
+    if label.startswith(f"{LABEL_PREFIX}.once."):
+        return {
+            "kind": "once",
+            "year": None,
+            "hour": interval["Hour"],
+            "minute": interval["Minute"],
+            "day": interval.get("Day"),
+            "month": interval.get("Month"),
+        }
+
+    entries = interval if isinstance(interval, list) else [interval]
+    first = entries[0]
+    weekdays = sorted({entry["Weekday"] for entry in entries if "Weekday" in entry}) or None
+    return {
+        "kind": "recurring",
+        "year": None,
+        "hour": first["Hour"],
+        "minute": first["Minute"],
+        "day": first.get("Day"),
+        "month": first.get("Month"),
+        "weekdays": weekdays,
+        "scheduled_time": time_schedule(first["Hour"], first["Minute"]),
+    }
+
+
+def inspect_existing_job(name_or_label: str) -> dict:
+    labels = resolve_existing_labels_or_die(name_or_label)
+    once = next((label for label in labels if label.startswith(f"{LABEL_PREFIX}.once.")), None)
+    primary = once or resolve_primary_label(name_or_label)
+    payload = read_plist(installed_plist_path(primary))
+    program_arguments = runner_program_arguments(primary, payload)
+    command, command_args, use_open = extract_runner_command(program_arguments)
+    env = payload.get("EnvironmentVariables", {})
+
+    if command.endswith("/tools/launch_codex_prompt.sh"):
+        workspace = None
+        for idx, value in enumerate(command_args):
+            if value == "--workspace" and idx + 1 < len(command_args):
+                workspace = command_args[idx + 1]
+                break
+        spec = {
+            "type": "codex",
+            "prompt": env.get(PROMPT_ENV_KEY),
+            "workspace": workspace,
+        }
+    elif command == "/usr/bin/osascript" and len(command_args) >= 2 and command_args[0] == "-e":
+        title, body = parse_notification_script(command_args[1])
+        spec = {
+            "type": "notification",
+            "title": title,
+            "body": body,
+        }
+    else:
+        raise SystemExit(f"job '{name_or_label}' is not editable through this CLI")
+
+    return {
+        "name": sanitize_name(name_or_label if not name_or_label.startswith(f"{LABEL_PREFIX}.") else primary.split(".")[-1]),
+        "label": primary,
+        "labels": labels,
+        "config": schedule_config_from_payload(primary, payload),
+        "cwd": payload.get("WorkingDirectory"),
+        "stdout": payload.get("StandardOutPath"),
+        "stderr": payload.get("StandardErrorPath"),
+        "extra_env": payload_extra_env(payload),
+        "use_open": use_open,
+        "has_recovery": any(label.endswith(".recovery") for label in labels) if not once else False,
+        **spec,
+    }
+
+
+def schedule_flags_supplied(args: argparse.Namespace) -> bool:
+    return any(
+        value is not None for value in (args.time, args.daily, args.weekdays, args.weekly, args.at, args.year, args.minute, args.hour, args.day, args.month)
+    ) or bool(args.weekday) or bool(getattr(args, "once", False)) or bool(getattr(args, "weekdays_only", False))
+
+
+def install_schedule(
+    *,
+    name: str,
+    config: dict,
+    command: str,
+    command_args: list[str],
+    use_open: bool,
+    cwd: str | None,
+    stdout: str | None,
+    stderr: str | None,
+    env: list[str],
+    has_recovery: bool,
+) -> None:
+    if config["kind"] == "once":
+        label = once_label(name)
+        argv = once_runner_argv(
+            job=name,
+            label=label,
+            command=command,
+            command_args=command_args,
+            use_open=use_open,
+        )
+        wrapper = write_once_wrapper(label, argv)
+        payload = build_generated_plist(
+            label,
+            [str(wrapper)],
+            minute=config["minute"],
+            hour=config["hour"],
+            month=config["month"],
+            day=config["day"],
+            cwd=cwd,
+            stdout_path=stdout,
+            stderr_path=stderr,
+            extra_env=env,
+        )
+        install_job(label, payload)
+        return
+
+    primary = primary_label(name)
+    primary_payload = build_generated_plist(
+        primary,
+        recurring_runner_argv(
+            job=name,
+            trigger_kind="scheduled",
+            scheduled_time=config["scheduled_time"],
+            day=config["day"],
+            month=config["month"],
+            command=command,
+            command_args=command_args,
+            use_open=use_open,
+            weekdays=config["weekdays"],
+        ),
+        minute=config["minute"],
+        hour=config["hour"],
+        month=config["month"],
+        day=config["day"],
+        weekdays=config["weekdays"],
+        cwd=cwd,
+        stdout_path=stdout,
+        stderr_path=stderr,
+        extra_env=env,
+    )
+    install_job(primary, primary_payload)
+
+    if not has_recovery:
+        return
+
+    recovery = recovery_label(name)
+    recovery_payload = build_generated_plist(
+        recovery,
+        recurring_runner_argv(
+            job=name,
+            trigger_kind="recovery",
+            scheduled_time=config["scheduled_time"],
+            day=config["day"],
+            month=config["month"],
+            command=command,
+            command_args=command_args,
+            use_open=use_open,
+            weekdays=config["weekdays"],
+        ),
+        calendar_entries=recovery_calendar_entries(
+            weekdays=config["weekdays"],
+            day=config["day"],
+            month=config["month"],
+        ),
+        cwd=cwd,
+        stdout_path=stdout,
+        stderr_path=stderr,
+        extra_env=env,
+    )
+    install_job(recovery, recovery_payload)
 
 
 def bootout(label: str) -> None:
@@ -446,6 +686,8 @@ def resolve_schedule_config(args: argparse.Namespace) -> dict:
 
     if args.at:
         dt = parse_future_once_time(args.at)
+        if dt.year != datetime.now().year:
+            raise SystemExit("one-off --at schedules must be within the current calendar year")
         return {
             "kind": "once",
             "year": dt.year,
@@ -528,6 +770,8 @@ def resolve_schedule_config(args: argparse.Namespace) -> dict:
                 raise SystemExit("--once with explicit calendar fields requires --year, --month, and --day")
             validate_calendar_combination(year=args.year, month=args.month, day=args.day)
             dt = datetime(args.year, args.month, args.day, args.hour, args.minute)
+            if dt.year != datetime.now().year:
+                raise SystemExit("explicit one-off schedules must be within the current calendar year")
             if dt <= datetime.now():
                 raise SystemExit("explicit one-off schedule must be in the future")
             return {
@@ -611,6 +855,16 @@ def list_known_jobs() -> list[tuple[str, str, str]]:
     return rows
 
 
+def stale_once_labels() -> list[str]:
+    labels: list[str] = []
+    for _, kind, label in list_known_jobs():
+        if kind != "once":
+            continue
+        if launchctl_print(label).returncode != 0:
+            labels.append(label)
+    return labels
+
+
 def cmd_list(_: argparse.Namespace) -> None:
     rows = list_known_jobs()
     if not rows:
@@ -672,91 +926,83 @@ def cmd_remove(args: argparse.Namespace) -> None:
         print_text(f"removed {label}")
 
 
+def cmd_remove_all(_: argparse.Namespace) -> None:
+    rows = list_known_jobs()
+    if not rows:
+        print_text("no jobs installed")
+        return
+    for _, _, label in rows:
+        uninstall_label(label)
+        wrapper_path(label).unlink(missing_ok=True)
+        print_text(f"removed {label}")
+
+
+
+def cmd_prune_once(_: argparse.Namespace) -> None:
+    labels = stale_once_labels()
+    if not labels:
+        print_text("no stale one-off jobs found")
+        return
+    for label in labels:
+        uninstall_label(label)
+        wrapper_path(label).unlink(missing_ok=True)
+        print_text(f"pruned {label}")
+
+
+def cmd_get_prompt(args: argparse.Namespace) -> None:
+    for label in resolve_existing_labels_or_die(args.job):
+        payload = read_plist(installed_plist_path(label))
+        env = payload.get("EnvironmentVariables", {})
+        prompt = env.get(PROMPT_ENV_KEY)
+        if prompt is not None:
+            print_text(prompt)
+            return
+    raise SystemExit(f"job '{args.job}' does not have a stored Codex prompt")
+
+
+def cmd_get_time(args: argparse.Namespace) -> None:
+    job = inspect_existing_job(args.job)
+    config = job["config"]
+    if config["kind"] == "once":
+        if config["day"] is None or config["month"] is None:
+            raise SystemExit(f"job '{args.job}' has an unsupported one-off schedule")
+        print_text(f"once {config['month']:02d}-{config['day']:02d} {config['hour']:02d}:{config['minute']:02d}")
+        return
+
+    if config.get("weekdays") == [1, 2, 3, 4, 5]:
+        print_text(f"weekdays {config['scheduled_time']}")
+        return
+    if config.get("weekdays") and len(config["weekdays"]) == 1:
+        weekday = config["weekdays"][0]
+        print_text(f"weekly {weekday}@{config['scheduled_time']}")
+        return
+    if config.get("day") is not None or config.get("month") is not None:
+        parts = [f"time {config['hour']:02d}:{config['minute']:02d}"]
+        if config.get("month") is not None:
+            parts.append(f"month {config['month']}")
+        if config.get("day") is not None:
+            parts.append(f"day {config['day']}")
+        print_text(" ".join(parts))
+        return
+    print_text(f"daily {config['scheduled_time']}")
+
+
 def cmd_schedule(args: argparse.Namespace) -> None:
     name = sanitize_name(args.name)
-    command = normalize_command_path(args.command, args.cwd)
-    command_args = args.command_args
     config = resolve_schedule_config(args)
-
-    if config["kind"] == "once":
-        label = once_label(name)
-        argv = once_runner_argv(
-            job=name,
-            label=label,
-            command=command,
-            command_args=command_args,
-            use_open=args.open,
-        )
-        wrapper = write_once_wrapper(label, argv)
-        payload = build_generated_plist(
-            label,
-            [str(wrapper)],
-            minute=config["minute"],
-            hour=config["hour"],
-            month=config["month"],
-            day=config["day"],
-            cwd=args.cwd,
-            stdout_path=args.stdout,
-            stderr_path=args.stderr,
-            extra_env=args.env,
-        )
-        install_job(label, payload)
-        return
-
-    primary = primary_label(name)
-    primary_payload = build_generated_plist(
-        primary,
-        recurring_runner_argv(
-            job=name,
-            trigger_kind="scheduled",
-            scheduled_time=config["scheduled_time"],
-            day=config["day"],
-            month=config["month"],
-            command=command,
-            command_args=command_args,
-            use_open=args.open,
-            weekdays=config["weekdays"],
-        ),
-        minute=config["minute"],
-        hour=config["hour"],
-        month=config["month"],
-        day=config["day"],
-        weekdays=config["weekdays"],
+    command = normalize_command_path(args.command, args.cwd)
+    install_schedule(
+        name=name,
+        config=config,
+        command=command,
+        command_args=args.command_args,
+        use_open=args.open,
         cwd=args.cwd,
-        stdout_path=args.stdout,
-        stderr_path=args.stderr,
-        extra_env=args.env,
+        stdout=args.stdout,
+        stderr=args.stderr,
+        env=args.env,
+        has_recovery=not args.no_recurring_fallback and config["kind"] == "recurring",
     )
-    install_job(primary, primary_payload)
-
-    if args.no_recurring_fallback:
-        return
-
-    recovery = recovery_label(name)
-    recovery_payload = build_generated_plist(
-        recovery,
-        recurring_runner_argv(
-            job=name,
-            trigger_kind="recovery",
-            scheduled_time=config["scheduled_time"],
-            day=config["day"],
-            month=config["month"],
-            command=command,
-            command_args=command_args,
-            use_open=args.open,
-            weekdays=config["weekdays"],
-        ),
-        calendar_entries=recovery_calendar_entries(
-            weekdays=config["weekdays"],
-            day=config["day"],
-            month=config["month"],
-        ),
-        cwd=args.cwd,
-        stdout_path=args.stdout,
-        stderr_path=args.stderr,
-        extra_env=args.env,
-    )
-    install_job(recovery, recovery_payload)
 
 
 def cmd_schedule_once(args: argparse.Namespace) -> None:
@@ -789,15 +1035,29 @@ def cmd_schedule_once(args: argparse.Namespace) -> None:
 
 
 def cmd_schedule_codex(args: argparse.Namespace) -> None:
+    config = resolve_schedule_config(args)
+    effective_prompt = build_codex_prompt(args.prompt, recurring=config["kind"] == "recurring")
     command, command_args, use_open = codex_command_args(
-        prompt=args.prompt,
+        prompt=effective_prompt,
         workspace=args.workspace,
         job_name=sanitize_name(args.name),
     )
     args.command = command
     args.command_args = command_args
     args.open = use_open
-    cmd_schedule(args)
+    args.env = upsert_env(args.env, PROMPT_ENV_KEY, effective_prompt)
+    install_schedule(
+        name=sanitize_name(args.name),
+        config=config,
+        command=command,
+        command_args=command_args,
+        use_open=use_open,
+        cwd=args.cwd,
+        stdout=args.stdout,
+        stderr=args.stderr,
+        env=args.env,
+        has_recovery=not args.no_recurring_fallback and config["kind"] == "recurring",
+    )
 
 
 def cmd_schedule_notification(args: argparse.Namespace) -> None:
@@ -806,6 +1066,49 @@ def cmd_schedule_notification(args: argparse.Namespace) -> None:
     args.command_args = command_args
     args.open = use_open
     cmd_schedule(args)
+
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    job = inspect_existing_job(args.job)
+    if schedule_flags_supplied(args):
+        config = resolve_schedule_config(args)
+        if config["kind"] != job["config"]["kind"]:
+            raise SystemExit("edit cannot change a job between recurring and one-off")
+    else:
+        config = job["config"]
+
+    if job["type"] == "codex":
+        if args.prompt is not None:
+            prompt = build_codex_prompt(args.prompt, recurring=config["kind"] == "recurring")
+        else:
+            prompt = job["prompt"]
+        workspace = args.workspace if args.workspace is not None else job["workspace"]
+        if prompt is None:
+            raise SystemExit("stored Codex prompt is missing; pass --prompt explicitly")
+        command, command_args, use_open = codex_command_args(
+            prompt=prompt,
+            workspace=workspace,
+            job_name=job["name"],
+        )
+        env = upsert_env(job["extra_env"], PROMPT_ENV_KEY, prompt)
+    else:
+        title = args.title if args.title is not None else job["title"]
+        body = args.body if args.body is not None else job["body"]
+        command, command_args, use_open = notification_command_args(title=title, body=body)
+        env = job["extra_env"]
+
+    install_schedule(
+        name=job["name"],
+        config=config,
+        command=command,
+        command_args=command_args,
+        use_open=use_open,
+        cwd=job["cwd"],
+        stdout=job["stdout"],
+        stderr=job["stderr"],
+        env=env,
+        has_recovery=job["has_recovery"],
+    )
 
 
 def add_schedule_shape_args(cmd: argparse.ArgumentParser) -> None:
@@ -845,7 +1148,7 @@ def add_schedule_runtime_args(cmd: argparse.ArgumentParser, *, include_open: boo
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage launchd schedules for agent commands, Codex runs, and macOS notifications.",
+        description="Manage launchd schedules for Codex runs and macOS notifications.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -856,11 +1159,15 @@ def build_parser() -> argparse.ArgumentParser:
         "restart": ("Reload a job and its companion jobs", cmd_restart),
         "run": ("Trigger a recurring job immediately", cmd_run),
         "remove": ("Unload and remove a job and its companion jobs", cmd_remove),
+        "get-prompt": ("Print the stored Codex prompt for a job", cmd_get_prompt),
+        "get-time": ("Print the stored schedule time for a job", cmd_get_time),
     }
     for name, (help_text, func) in job_arg_commands.items():
         cmd = sub.add_parser(name, help=help_text)
         if name == "status":
             cmd.add_argument("job", nargs="?", help="Job name or exact launchd label")
+        elif name == "get-time":
+            cmd.add_argument("job", help="Job name or exact launchd label")
         else:
             cmd.add_argument("job", help="Job name or exact launchd label")
         if name == "remove":
@@ -870,16 +1177,23 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd = sub.add_parser("list", help="List installed scheduler jobs")
     list_cmd.set_defaults(func=cmd_list)
 
-    schedule = sub.add_parser(
-        "schedule",
-        help="Create a launchd job from convenience flags or explicit calendar fields",
-        epilog="Pass arguments to the scheduled command after '--'. Example: --command /path/to/launcher.sh -- --prompt-file /path/to/prompt.md",
+    remove_all_cmd = sub.add_parser("remove-all", help="Unload and remove all scheduler jobs")
+    remove_all_cmd.set_defaults(func=cmd_remove_all)
+
+    prune_once_cmd = sub.add_parser("prune-once", help="Remove stale one-off jobs left behind after execution")
+    prune_once_cmd.set_defaults(func=cmd_prune_once)
+
+    edit_cmd = sub.add_parser(
+        "edit",
+        help="Edit an existing schedule's timing or payload",
     )
-    schedule.add_argument("name", help="Friendly name for the generated job")
-    add_schedule_shape_args(schedule)
-    schedule.add_argument("--command", required=True, help="Path to the script or file to run; relative paths are normalized at install time")
-    add_schedule_runtime_args(schedule)
-    schedule.set_defaults(func=cmd_schedule)
+    edit_cmd.add_argument("job", help="Job name or exact launchd label")
+    add_schedule_shape_args(edit_cmd)
+    edit_cmd.add_argument("--prompt", help="New prompt text for a Codex schedule")
+    edit_cmd.add_argument("--workspace", help="New workspace path for a Codex schedule")
+    edit_cmd.add_argument("--title", help="New notification title")
+    edit_cmd.add_argument("--body", help="New notification body")
+    edit_cmd.set_defaults(func=cmd_edit)
 
     schedule_codex = sub.add_parser(
         "schedule-codex",
@@ -902,21 +1216,6 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_notification.add_argument("--body", required=True, help="Notification body")
     add_schedule_runtime_args(schedule_notification, include_open=False)
     schedule_notification.set_defaults(func=cmd_schedule_notification, open=False)
-
-    schedule_once = sub.add_parser(
-        "schedule-once",
-        help="Create a one-time job that removes itself after execution",
-        epilog="Pass arguments to the scheduled command after '--'. Example: --command /path/to/launcher.sh -- --prompt-file /path/to/prompt.md",
-    )
-    schedule_once.add_argument("name", help="Friendly name for the generated job")
-    schedule_once.add_argument("--at", required=True, help="Execution time, 'YYYY-MM-DD HH:MM'")
-    schedule_once.add_argument("--command", required=True, help="Path to the script or file to run; relative paths are normalized at install time")
-    schedule_once.add_argument("--open", action="store_true", help="Run the command through /usr/bin/open")
-    schedule_once.add_argument("--cwd", help="Working directory for the job")
-    schedule_once.add_argument("--stdout", help="StandardOutPath for the job")
-    schedule_once.add_argument("--stderr", help="StandardErrorPath for the job")
-    schedule_once.add_argument("--env", action="append", default=[], help="Extra environment variable, KEY=VALUE")
-    schedule_once.set_defaults(func=cmd_schedule_once)
 
     return parser
 

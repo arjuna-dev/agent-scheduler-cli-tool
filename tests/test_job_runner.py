@@ -1,5 +1,7 @@
 import importlib.util
+import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -47,7 +49,30 @@ class JobRunnerTests(unittest.TestCase):
         self.assertEqual(command_args, ["--prompt-file", "/tmp/prompt.md"])
 
     def test_cleanup_once_job_ignores_empty_label(self):
-        self.assertIsNone(self.job_runner.cleanup_once_job(None))
+        self.assertEqual(self.job_runner.cleanup_once_job(None), {"attempted": False, "reason": "missing label"})
+
+    def test_cleanup_once_job_unlinks_plist_and_defers_launchctl_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launch_agents = Path(tmp)
+            plist_path = launch_agents / 'com.agent-scheduler.once.demo.plist'
+            plist_path.write_text('plist', encoding='utf-8')
+            original_dir = self.job_runner.LAUNCH_AGENTS_DIR
+            self.job_runner.LAUNCH_AGENTS_DIR = launch_agents
+            proc = mock.Mock(pid=4321)
+            try:
+                with mock.patch.object(self.job_runner.subprocess, 'Popen', return_value=proc) as popen_mock:
+                    info = self.job_runner.cleanup_once_job('com.agent-scheduler.once.demo')
+            finally:
+                self.job_runner.LAUNCH_AGENTS_DIR = original_dir
+
+        self.assertFalse(plist_path.exists())
+        self.assertIsNone(info['unlink_error'])
+        self.assertFalse(info['plist_exists_after_unlink'])
+        self.assertEqual(info['deferred_cleanup_pid'], 4321)
+        popen_args = popen_mock.call_args.args[0]
+        self.assertEqual(popen_args[:2], ['/bin/sh', '-c'])
+        self.assertIn(str(plist_path), popen_args[2])
+        self.assertIn(f'{self.job_runner.DOMAIN}/com.agent-scheduler.once.demo', popen_args[2])
 
 
 if __name__ == "__main__":

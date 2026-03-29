@@ -14,6 +14,9 @@ from pathlib import Path
 
 SUPPORT_DIR = Path.home() / ".local" / "share" / "agent-scheduler"
 RUNS_DIR = SUPPORT_DIR / "runs"
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+DOMAIN = f"gui/{os.getuid()}"
+LAUNCHCTL = "/bin/launchctl"
 
 
 def sanitize_name(name: str) -> str:
@@ -132,21 +135,34 @@ def run_command(argv: list[str], extra_env: dict[str, str]) -> int:
     return proc.returncode
 
 
-def cleanup_once_job(label: str | None) -> None:
+def cleanup_once_job(label: str | None) -> dict[str, object]:
     if not label:
-        return
-    subprocess.run(
-        [
-            "python3",
-            str(Path(__file__).resolve().with_name("scheduler.py")),
-            "remove",
-            label,
-            "--label",
-        ],
-        check=False,
+        return {"attempted": False, "reason": "missing label"}
+    plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
+    info: dict[str, object] = {
+        "attempted": True,
+        "label": label,
+        "plist": str(plist_path),
+        "plist_exists_before": plist_path.exists(),
+    }
+    try:
+        plist_path.unlink(missing_ok=True)
+        info["unlink_error"] = None
+    except OSError as exc:
+        info["unlink_error"] = str(exc)
+    info["plist_exists_after_unlink"] = plist_path.exists()
+    cleanup_script = (
+        f'sleep 1; "{LAUNCHCTL}" bootout "{DOMAIN}" "{plist_path}" >/dev/null 2>&1 || true; '
+        f'"{LAUNCHCTL}" disable "{DOMAIN}/{label}" >/dev/null 2>&1 || true'
+    )
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", cleanup_script],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
+    info["deferred_cleanup_pid"] = proc.pid
+    return info
 
 
 def runtime_env(*, job: str, trigger_kind: str, run_dir: Path, scheduled_time: str | None = None) -> dict[str, str]:
@@ -271,6 +287,7 @@ def handle_once(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
 
+    cleanup_info: dict[str, object] | None = None
     try:
         exit_code = run_command(
             command,
@@ -290,7 +307,21 @@ def handle_once(args: argparse.Namespace) -> int:
         )
         return exit_code
     finally:
-        cleanup_once_job(args.cleanup_label)
+        cleanup_info = cleanup_once_job(args.cleanup_label)
+        append_run_markdown(
+            run_md,
+            [
+                "",
+                "## Cleanup",
+                f"- Attempted: {cleanup_info.get('attempted')}",
+                f"- Label: {cleanup_info.get('label', '')}",
+                f"- Plist: {cleanup_info.get('plist', '')}",
+                f"- Plist existed before: {cleanup_info.get('plist_exists_before')}",
+                f"- unlink error: {cleanup_info.get('unlink_error', '')}",
+                f"- Plist exists after unlink: {cleanup_info.get('plist_exists_after_unlink')}",
+                f"- Deferred cleanup pid: {cleanup_info.get('deferred_cleanup_pid', '')}",
+            ],
+        )
 
 
 def main() -> None:

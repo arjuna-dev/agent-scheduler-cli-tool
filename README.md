@@ -1,132 +1,109 @@
 # Agent Scheduler
 
-`agent-scheduler` is a small macOS `launchd` wrapper for scheduling local commands. It is designed for agent workflows, not interactive human use.
+`agent-scheduler` is a macOS `launchd` wrapper for agent-driven scheduling.
 
-The CLI installs and removes `LaunchAgents`, supports recurring and one-off schedules, and records each execution under `~/.local/share/agent-scheduler/runs`.
+The public CLI intentionally exposes only two schedule types:
 
-The agent-facing entrypoints are explicit:
+- `schedule-codex`
+- `schedule-notification`
 
-- `schedule-codex` for Codex runs
-- `schedule-notification` for macOS notifications
-- `schedule` and `schedule-once` remain available as low-level generic command schedulers
+There is no generic `schedule` command anymore. That is deliberate so agents do not choose an arbitrary-command path when the real intent is a Codex run or a notification.
 
 ## Install
-
-Global install is a symlink created by [tools/install-global-scheduler.sh](/Users/alejandrocamus/Documents/dev/declawtter-w-scheduler/tools/install-global-scheduler.sh):
 
 ```sh
 ./tools/install-global-scheduler.sh
 ```
 
-That installs `agent-scheduler` into the first writable directory of:
+That installs a global `agent-scheduler` symlink into the first writable directory among:
 
 - `/opt/homebrew/bin`
 - `~/.local/bin`
 - `~/bin`
 
-## Behavior
+Verify:
 
-- Recurring jobs install a primary `launchd` job plus a recovery job by default.
-- One-off jobs remove themselves after they fire.
-- Command paths are normalized to absolute paths at install time.
-- Extra command arguments are passed after `--`.
-- Runtime markers and run logs are written under `~/.local/share/agent-scheduler`.
-
-Runtime environment variables exposed to scheduled commands:
-
-- `AGENT_SCHEDULER_JOB`
-- `AGENT_SCHEDULER_TRIGGER_KIND`
-- `AGENT_SCHEDULER_RUN_DIR`
-- `AGENT_SCHEDULER_SCHEDULED_TIME` for recurring runs
-- `HEYDATA_SCHEDULE_JOB`
-- `HEYDATA_TRIGGER_KIND`
-- `HEYDATA_RUN_DIR`
-- `HEYDATA_SCHEDULED_TIME` for recurring runs
+```sh
+agent-scheduler -h
+```
 
 ## Commands
 
-This CLI is intended to be machine-invoked. Labels are deterministic:
-
-- Recurring primary: `com.agent-scheduler.recurring.<name>`
-- Recurring recovery: `com.agent-scheduler.recurring.<name>.recovery`
-- One-off: `com.agent-scheduler.once.<name>`
-
-Inspection and lifecycle:
+Lifecycle:
 
 ```sh
 agent-scheduler list
-agent-scheduler status <job-or-label>
-agent-scheduler enable <job-or-label>
-agent-scheduler disable <job-or-label>
-agent-scheduler restart <job-or-label>
-agent-scheduler run <job-name>
-agent-scheduler remove <job-or-label>
+agent-scheduler get-time <job>
+agent-scheduler status <job>
+agent-scheduler enable <job>
+agent-scheduler disable <job>
+agent-scheduler restart <job>
+agent-scheduler run <job>
+agent-scheduler get-prompt <job>
+agent-scheduler edit <job> --daily 10:00 --prompt "Updated prompt"
+agent-scheduler remove <job>
 agent-scheduler remove <exact-label> --label
+agent-scheduler prune-once
+agent-scheduler remove-all
 ```
 
-## Scheduling
-
-Main agent-oriented commands:
+Agent-facing scheduling:
 
 ```sh
 agent-scheduler schedule-codex morning-review --daily 09:30 --prompt "Review the repo and summarize blockers." --workspace /tmp/repo
 agent-scheduler schedule-notification drink-water --daily 14:00 --title "Reminder" --body "Drink water."
 ```
 
-Codex one-off example:
-
-```sh
-agent-scheduler schedule-codex release-check --at "2026-04-01 14:30" --prompt "Check release readiness and report risks." --workspace /tmp/repo
-```
-
-Notification one-off example:
-
-```sh
-agent-scheduler schedule-notification deploy-window --at "2026-04-01 14:30" --title "Deploy" --body "Deploy window opens now."
-```
-
-Recurring examples:
-
-```sh
-agent-scheduler schedule repo-sync --daily 09:30 --command ./tools/sync.sh
-agent-scheduler schedule weekday-report --weekdays 18:00 --command ./tools/report.sh
-agent-scheduler schedule monday-review --weekly mon@10:15 --command ./tools/review.sh
-agent-scheduler schedule month-end --hour 9 --minute 0 --day 1 --command ./tools/close.sh
-```
-
 One-off examples:
 
 ```sh
-agent-scheduler schedule-once ad-hoc-task --at "2026-04-01 14:30" --command ./tools/task.sh
-agent-scheduler schedule deploy-window --at "2026-04-01 14:30" --command ./tools/task.sh
-agent-scheduler schedule maintenance --once --year 2026 --month 4 --day 1 --hour 14 --minute 30 --command ./tools/task.sh
+agent-scheduler schedule-codex release-check --at "2026-04-01 14:30" --prompt "Check release readiness and report risks." --workspace /tmp/repo
+agent-scheduler schedule-notification deploy-window --at "2026-04-01 14:30" --title "Deploy" --body "Deploy window opens now."
 ```
 
-Low-level generic command example:
+## Behavior
 
-```sh
-agent-scheduler schedule prompt-job --daily 08:00 --command ./tools/launch_codex_prompt.sh -- --prompt-file /tmp/prompt.md
-```
+- Recurring jobs install a primary `launchd` job plus a recovery job by default.
+- Recovery jobs wake every 30 minutes after the scheduled time and exit if that slot already fired.
+- One-off jobs remove themselves after they run.
+- `prune-once` removes stale one-off plist leftovers for one-off jobs that are no longer loaded in `launchd`.
+- `remove-all` removes every scheduler-managed job, including recurring, recovery, and one-off jobs.
+- `schedule-codex` stores the effective prompt text directly in the scheduled job.
+- Every Codex schedule prepends hardcoded instructions to treat the working directory as the workspace root, read `AGENTS.md` there first when it exists, pay attention to relevant workspace files, and save the full session as markdown under `WORKSPACE/SESSIONS/` with a timestamped filename.
+- Recurring Codex schedules also prepend hardcoded instructions to inspect the most recent prior session date and create a distilled day-level memory file under `WORKSPACE/MEMORY/YYYY-MM-DD.md` when that memory does not already exist.
+- `get-prompt` reads the stored prompt from the installed job plist.
+- `edit` updates an existing schedule in place while preserving unspecified fields.
+- Runtime logs and markers are stored under `~/.local/share/agent-scheduler`.
 
-`schedule-codex` stores the prompt text directly in the scheduled job. It does not require a prompt file at runtime.
+Runtime environment variables exposed to scheduled commands:
 
-Useful flags:
+- `AGENT_SCHEDULER_JOB`
+- `AGENT_SCHEDULER_TRIGGER_KIND`
+- `AGENT_SCHEDULER_RUN_DIR`
+- `AGENT_SCHEDULER_PROMPT` for Codex schedules
+- `AGENT_SCHEDULER_SCHEDULED_TIME` for recurring runs
+- `HEYDATA_SCHEDULE_JOB`
+- `HEYDATA_TRIGGER_KIND`
+- `HEYDATA_RUN_DIR`
+- `HEYDATA_SCHEDULED_TIME` for recurring runs
 
-- `--cwd` sets `WorkingDirectory`
-- `--stdout` sets `StandardOutPath`
-- `--stderr` sets `StandardErrorPath`
-- `--env KEY=VALUE` adds environment variables to the `launchd` job
-- `--open` runs the target through `/usr/bin/open`
-- `--no-recurring-fallback` disables the paired recovery job for recurring schedules
+Useful flags shared by both schedule types:
+
+- `--daily`, `--weekdays`, `--weekly`, `--at`
+- explicit calendar fields: `--hour`, `--minute`, `--day`, `--month`, `--weekday`
+- `--once` and `--year` for explicit one-off schedules
+- `--cwd`
+- `--stdout`
+- `--stderr`
+- `--env KEY=VALUE`
+- `--no-recurring-fallback`
 
 ## Files
 
-- [tools/scheduler.py](/Users/alejandrocamus/Documents/dev/declawtter-w-scheduler/tools/scheduler.py): CLI entrypoint and `launchd` plist generator
-- [tools/job_runner.py](/Users/alejandrocamus/Documents/dev/declawtter-w-scheduler/tools/job_runner.py): runtime guard, run logging, and one-off cleanup
-- [tools/install-global-scheduler.sh](/Users/alejandrocamus/Documents/dev/declawtter-w-scheduler/tools/install-global-scheduler.sh): global symlink installer
-- `~/Library/LaunchAgents`: installed plists
-- `~/.local/share/agent-scheduler/jobs`: generated wrapper scripts
-- `~/.local/share/agent-scheduler/runs`: per-run logs and markers
+- [tools/scheduler.py](/Users/alejandrocamus/Documents/dev/agent-scheduler/tools/scheduler.py): CLI entrypoint and plist generation
+- [tools/job_runner.py](/Users/alejandrocamus/Documents/dev/agent-scheduler/tools/job_runner.py): runtime guard, run logging, and one-off cleanup
+- [tools/launch_codex_prompt.sh](/Users/alejandrocamus/Documents/dev/agent-scheduler/tools/launch_codex_prompt.sh): Codex launcher used by `schedule-codex`
+- [tools/install-global-scheduler.sh](/Users/alejandrocamus/Documents/dev/agent-scheduler/tools/install-global-scheduler.sh): global installer
 
 ## Testing
 
