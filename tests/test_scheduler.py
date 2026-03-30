@@ -109,6 +109,23 @@ class SchedulerTests(unittest.TestCase):
             },
         )
 
+    def test_edit_daily_args_resolve_without_weekdays_only_flag(self):
+        args = self.parse_edit_args("--daily", "09:40")
+        config = self.scheduler.resolve_schedule_config(args)
+        self.assertEqual(
+            config,
+            {
+                "kind": "recurring",
+                "year": None,
+                "hour": 9,
+                "minute": 40,
+                "day": None,
+                "month": None,
+                "weekdays": None,
+                "scheduled_time": "09:40",
+            },
+        )
+
     def test_build_generated_plist_omits_year_for_once_jobs(self):
         payload = self.scheduler.build_generated_plist(
             'com.agent-scheduler.once.demo',
@@ -214,6 +231,19 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(
             command_args,
             ["--prompt", "Solve the task", "--job-name", "demo-job", "--workspace", "/tmp/workspace"],
+        )
+        self.assertFalse(use_open)
+
+    def test_codex_command_args_omits_workspace_when_disabled(self):
+        command, command_args, use_open = self.scheduler.codex_command_args(
+            prompt="Solve the task",
+            workspace=None,
+            job_name="demo-job",
+        )
+        self.assertTrue(command.endswith("/tools/launch_codex_prompt.sh"))
+        self.assertEqual(
+            command_args,
+            ["--prompt", "Solve the task", "--job-name", "demo-job"],
         )
         self.assertFalse(use_open)
 
@@ -379,7 +409,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("'/tmp/task.py'", content)
 
     def test_schedule_codex_parser_exposes_prompt(self):
-        args = self.parse_codex_args("--daily", "09:30")
+        args = self.parse_codex_args("--daily", "09:30", "--workspace", "/tmp/workspace")
         self.assertEqual(args.prompt, "Solve the task")
         self.assertEqual(args.daily, "09:30")
         self.assertFalse(args.open)
@@ -389,6 +419,10 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(args.daily, "10:15")
         self.assertEqual(args.prompt, "Updated prompt")
 
+    def test_edit_parser_accepts_no_workspace(self):
+        args = self.parse_edit_args("--no-workspace")
+        self.assertTrue(args.no_workspace)
+
     def test_schedule_notification_parser_exposes_title_and_body(self):
         args = self.parse_notification_args("--daily", "09:30")
         self.assertEqual(args.title, "Title")
@@ -397,7 +431,7 @@ class SchedulerTests(unittest.TestCase):
 
 
     def test_build_codex_prompt_adds_session_instructions(self):
-        prompt = self.scheduler.build_codex_prompt("Solve the task", recurring=False)
+        prompt = self.scheduler.build_codex_prompt("Solve the task", recurring=False, workspace_root=True)
         self.assertIn("AGENTS.md", prompt)
         self.assertIn("workspace-local instructions", prompt)
         self.assertIn("SESSIONS/", prompt)
@@ -406,11 +440,50 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(prompt.endswith("Task:\nSolve the task"))
 
     def test_build_codex_prompt_adds_memory_instructions_for_recurring_jobs(self):
-        prompt = self.scheduler.build_codex_prompt("Solve the task", recurring=True)
+        prompt = self.scheduler.build_codex_prompt("Solve the task", recurring=True, workspace_root=True)
         self.assertIn("SESSIONS/", prompt)
         self.assertIn("MEMORY/", prompt)
         self.assertIn("most recent prior date", prompt)
         self.assertTrue(prompt.endswith("Task:\nSolve the task"))
+
+    def test_build_codex_prompt_without_workspace_omits_bootstrap_instructions(self):
+        prompt = self.scheduler.build_codex_prompt("Solve the task", recurring=True, workspace_root=False)
+        self.assertIn("scheduled Codex job", prompt)
+        self.assertNotIn("AGENTS.md", prompt)
+        self.assertNotIn("SESSIONS/", prompt)
+        self.assertNotIn("MEMORY/", prompt)
+        self.assertTrue(prompt.endswith("Task:\nSolve the task"))
+
+    def test_extract_task_prompt_returns_task_suffix(self):
+        prompt = self.scheduler.build_codex_prompt("Solve the task", recurring=True, workspace_root=True)
+        self.assertEqual(self.scheduler.extract_task_prompt(prompt), "Solve the task")
+
+    def test_schedule_codex_requires_workspace_by_default(self):
+        args = self.parse_codex_args("--daily", "09:30")
+        with self.assertRaises(SystemExit) as ctx:
+            self.scheduler.cmd_schedule_codex(args)
+        self.assertEqual(
+            str(ctx.exception),
+            "schedule-codex requires --workspace. Pass --no-workspace to allow running without workspace bootstrap.",
+        )
+
+    def test_schedule_codex_accepts_explicit_no_workspace(self):
+        args = self.parse_codex_args("--daily", "09:30", "--no-workspace")
+        original_install = self.scheduler.install_schedule
+        captured = {}
+
+        def fake_install_schedule(**kwargs):
+            captured.update(kwargs)
+
+        self.scheduler.install_schedule = fake_install_schedule
+        try:
+            self.scheduler.cmd_schedule_codex(args)
+        finally:
+            self.scheduler.install_schedule = original_install
+
+        self.assertNotIn("--workspace", captured["command_args"])
+        self.assertNotIn("SESSIONS/", captured["env"][-1])
+        self.assertNotIn("MEMORY/", captured["env"][-1])
 
 
 if __name__ == "__main__":

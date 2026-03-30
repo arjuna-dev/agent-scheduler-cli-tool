@@ -69,6 +69,8 @@ agent-scheduler schedule-notification deploy-window --at "2026-04-01 14:30" --ti
 - `prune-once` removes stale one-off plist leftovers for one-off jobs that are no longer loaded in `launchd`.
 - `remove-all` removes every scheduler-managed job, including recurring, recovery, and one-off jobs.
 - `schedule-codex` stores the effective prompt text directly in the scheduled job.
+- `schedule-codex` requires `--workspace` by default so Codex runs inside an explicit workspace instead of falling back to the user home directory.
+- Pass `--no-workspace` only when you intentionally want a Codex run without workspace bootstrap instructions and without `SESSIONS/` or `MEMORY/` writes.
 - Every Codex schedule prepends hardcoded instructions to treat the working directory as the workspace root, read `AGENTS.md` there first when it exists, pay attention to relevant workspace files, and save the full session as markdown under `WORKSPACE/SESSIONS/` with a timestamped filename.
 - Recurring Codex schedules also prepend hardcoded instructions to inspect the most recent prior session date and create a distilled day-level memory file under `WORKSPACE/MEMORY/YYYY-MM-DD.md` when that memory does not already exist.
 - `get-prompt` reads the stored prompt from the installed job plist.
@@ -97,6 +99,7 @@ Useful flags shared by both schedule types:
 - `--stderr`
 - `--env KEY=VALUE`
 - `--no-recurring-fallback`
+- `--no-workspace` for Codex schedules when you explicitly want to skip workspace bootstrap
 
 ## Files
 

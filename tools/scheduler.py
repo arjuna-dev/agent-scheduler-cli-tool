@@ -23,8 +23,8 @@ DOMAIN = f"gui/{os.getuid()}"
 LABEL_PREFIX = "com.agent-scheduler"
 PROMPT_ENV_KEY = "AGENT_SCHEDULER_PROMPT"
 RUNNER_PYTHON = str(Path(sys.executable).resolve())
-COMMON_CODEX_PROMPT_PREFIX = """You are running as a scheduled Codex job.
-Use the current working directory as the workspace root.
+SCHEDULED_CODEX_PROMPT_INTRO = "You are running as a scheduled Codex job."
+WORKSPACE_CODEX_PROMPT_PREFIX = """Use the current working directory as the workspace root.
 Before doing the main task, read `AGENTS.md` from the workspace root if it exists and follow the workspace-local instructions and conventions there. Also pay attention to relevant workspace files before acting.
 Before finishing this run, ensure `SESSIONS/` exists under the workspace root and save the whole conversation appending as you go with each message to a markdown file in `SESSIONS/` using a timestamped filename such as `YYYY-MM-DDTHH-MM-SS.md`.
 """
@@ -94,12 +94,21 @@ def upsert_env(extra_env: list[str], key: str, value: str) -> list[str]:
     return updated
 
 
-def build_codex_prompt(prompt: str, *, recurring: bool) -> str:
-    prefix_parts = [COMMON_CODEX_PROMPT_PREFIX.strip()]
-    if recurring:
+def build_codex_prompt(prompt: str, *, recurring: bool, workspace_root: bool) -> str:
+    prefix_parts = [SCHEDULED_CODEX_PROMPT_INTRO]
+    if workspace_root:
+        prefix_parts.append(WORKSPACE_CODEX_PROMPT_PREFIX.strip())
+    if workspace_root and recurring:
         prefix_parts.append(RECURRING_CODEX_PROMPT_PREFIX.strip())
     prefix = "\n\n".join(prefix_parts)
     return f"{prefix}\n\nTask:\n{prompt.strip()}"
+
+
+def extract_task_prompt(prompt: str) -> str:
+    marker = "\n\nTask:\n"
+    if marker in prompt:
+        return prompt.split(marker, 1)[1].strip()
+    return prompt.strip()
 
 
 def installed_plist_path(label: str) -> Path:
@@ -645,6 +654,26 @@ def codex_command_args(
     return command, args, False
 
 
+def resolve_codex_workspace_for_schedule(args: argparse.Namespace) -> str | None:
+    if args.workspace and args.no_workspace:
+        raise SystemExit("--workspace and --no-workspace cannot be combined")
+    if args.workspace is None and not args.no_workspace:
+        raise SystemExit("schedule-codex requires --workspace. Pass --no-workspace to allow running without workspace bootstrap.")
+    return args.workspace
+
+
+def resolve_codex_workspace_for_edit(args: argparse.Namespace, job: dict) -> tuple[str | None, bool]:
+    if args.workspace and args.no_workspace:
+        raise SystemExit("--workspace and --no-workspace cannot be combined")
+    if args.no_workspace:
+        workspace = None
+    elif args.workspace is not None:
+        workspace = args.workspace
+    else:
+        workspace = job["workspace"]
+    return workspace, (workspace is None) != (job["workspace"] is None)
+
+
 def time_schedule(hour: int, minute: int) -> str:
     return f"{hour:02d}:{minute:02d}"
 
@@ -740,7 +769,7 @@ def resolve_schedule_config(args: argparse.Namespace) -> dict:
         if args.once:
             raise SystemExit("--time/--daily cannot be combined with --once")
         hour, minute = parse_daily_time(daily_time)
-        weekdays = [1, 2, 3, 4, 5] if args.weekdays_only else None
+        weekdays = [1, 2, 3, 4, 5] if getattr(args, "weekdays_only", False) else None
         return {
             "kind": "recurring",
             "year": None,
@@ -1037,10 +1066,15 @@ def cmd_schedule_once(args: argparse.Namespace) -> None:
 
 def cmd_schedule_codex(args: argparse.Namespace) -> None:
     config = resolve_schedule_config(args)
-    effective_prompt = build_codex_prompt(args.prompt, recurring=config["kind"] == "recurring")
+    workspace = resolve_codex_workspace_for_schedule(args)
+    effective_prompt = build_codex_prompt(
+        args.prompt,
+        recurring=config["kind"] == "recurring",
+        workspace_root=workspace is not None,
+    )
     command, command_args, use_open = codex_command_args(
         prompt=effective_prompt,
-        workspace=args.workspace,
+        workspace=workspace,
         job_name=sanitize_name(args.name),
     )
     args.command = command
@@ -1079,11 +1113,24 @@ def cmd_edit(args: argparse.Namespace) -> None:
         config = job["config"]
 
     if job["type"] == "codex":
+        workspace, workspace_mode_changed = resolve_codex_workspace_for_edit(args, job)
         if args.prompt is not None:
-            prompt = build_codex_prompt(args.prompt, recurring=config["kind"] == "recurring")
+            task_prompt = args.prompt
+            prompt = build_codex_prompt(
+                task_prompt,
+                recurring=config["kind"] == "recurring",
+                workspace_root=workspace is not None,
+            )
+        elif workspace_mode_changed:
+            if job["prompt"] is None:
+                raise SystemExit("stored Codex prompt is missing; pass --prompt explicitly")
+            prompt = build_codex_prompt(
+                extract_task_prompt(job["prompt"]),
+                recurring=config["kind"] == "recurring",
+                workspace_root=workspace is not None,
+            )
         else:
             prompt = job["prompt"]
-        workspace = args.workspace if args.workspace is not None else job["workspace"]
         if prompt is None:
             raise SystemExit("stored Codex prompt is missing; pass --prompt explicitly")
         command, command_args, use_open = codex_command_args(
@@ -1192,6 +1239,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_schedule_shape_args(edit_cmd)
     edit_cmd.add_argument("--prompt", help="New prompt text for a Codex schedule")
     edit_cmd.add_argument("--workspace", help="New workspace path for a Codex schedule")
+    edit_cmd.add_argument("--no-workspace", action="store_true", help="Run a Codex schedule without workspace bootstrap or SESSIONS/MEMORY writes")
     edit_cmd.add_argument("--title", help="New notification title")
     edit_cmd.add_argument("--body", help="New notification body")
     edit_cmd.set_defaults(func=cmd_edit)
@@ -1204,6 +1252,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_schedule_shape_args(schedule_codex)
     schedule_codex.add_argument("--prompt", required=True, help="Prompt text to pass to Codex and store in the scheduled job")
     schedule_codex.add_argument("--workspace", help="Workspace path for the Codex run")
+    schedule_codex.add_argument("--no-workspace", action="store_true", help="Run without workspace bootstrap or SESSIONS/MEMORY writes")
     add_schedule_runtime_args(schedule_codex, include_open=False)
     schedule_codex.set_defaults(func=cmd_schedule_codex, open=False)
 

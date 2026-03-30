@@ -47,12 +47,12 @@ if [[ -n "$prompt" && -n "$prompt_file" ]]; then
   exit 1
 fi
 
-if [[ -z "$workspace" ]]; then
-  workspace="$PWD"
-fi
-
 script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-workspace_path="$(cd "$workspace" && pwd)"
+if [[ -n "$workspace" ]]; then
+  workspace_path="$(cd "$workspace" && pwd)"
+else
+  workspace_path=""
+fi
 if [[ -n "$prompt_file" ]]; then
   prompt_path="$(cd "$(dirname "$prompt_file")" && pwd)/$(basename "$prompt_file")"
 
@@ -70,26 +70,48 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 
 if [[ "$mode" == "run" ]]; then
-  cd "$workspace_path"
+  if [[ -n "$workspace_path" ]]; then
+    cd "$workspace_path"
+  fi
   if [[ -n "$job_name" ]]; then
     printf 'Launching scheduled Codex job: %s\n' "$job_name"
   fi
-  printf 'Workspace: %s\n' "$workspace_path"
+  if [[ -n "$workspace_path" ]]; then
+    printf 'Workspace: %s\n' "$workspace_path"
+  else
+    printf 'Workspace: none\n'
+  fi
   if [[ -n "$prompt_file" ]]; then
+    prompt_contents="$(cat "$prompt_path")"
+    case "$prompt_path" in
+      "${TMPDIR:-/tmp}"/agent-scheduler-prompt.*.txt)
+        rm -f "$prompt_path"
+        ;;
+    esac
     printf 'Prompt file: %s\n\n' "$prompt_path"
-    exec codex --no-alt-screen -C "$workspace_path" "$(cat "$prompt_path")"
+    if [[ -n "$workspace_path" ]]; then
+      exec codex --no-alt-screen -C "$workspace_path" "$prompt_contents"
+    fi
+    exec codex --no-alt-screen "$prompt_contents"
   fi
   printf 'Prompt: inline\n\n'
-  exec codex --no-alt-screen -C "$workspace_path" "$prompt"
+  if [[ -n "$workspace_path" ]]; then
+    exec codex --no-alt-screen -C "$workspace_path" "$prompt"
+  fi
+  exec codex --no-alt-screen "$prompt"
 fi
 
-if [[ -n "$prompt_file" ]]; then
-  terminal_command="$(printf "%q " "$script_path" --run-now --prompt-file "$prompt_path" --workspace "$workspace_path" --job-name "$job_name")"
-else
-  terminal_command="$(printf "%q " "$script_path" --run-now --prompt "$prompt" --workspace "$workspace_path" --job-name "$job_name")"
+if [[ -z "$prompt_file" ]]; then
+  staged_prompt_file="$(mktemp "${TMPDIR:-/tmp}/agent-scheduler-prompt.XXXXXX.txt")"
+  printf '%s' "$prompt" > "$staged_prompt_file"
+  prompt_path="$staged_prompt_file"
 fi
+terminal_command_parts=("$script_path" --run-now --prompt-file "$prompt_path" --job-name "$job_name")
+if [[ -n "$workspace_path" ]]; then
+  terminal_command_parts+=(--workspace "$workspace_path")
+fi
+terminal_command="$(printf "%q " "${terminal_command_parts[@]}")"
 terminal_command="${terminal_command% }"
-terminal_command="${terminal_command//\\/\\\\}"
 terminal_command="${terminal_command//\"/\\\"}"
 
 /usr/bin/osascript <<APPLESCRIPT
